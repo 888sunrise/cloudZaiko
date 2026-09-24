@@ -551,45 +551,69 @@
         window.searchTerm = '';
         window.db = null;
         window.auth = null;
-        window.appId = typeof __app_id !== 'undefined' ? __app_id : 'zaiko-app-default';
+        window.appId = typeof __app_id !== 'undefined' && __app_id ? __app_id : 'zaiko-app-default';
 
         // Safe Firebase Configuration setup
-        let firebaseConfig = {
-            apiKey: "AIzaSyAb3NPMFecrxDs3VwZjKzETsRlIuU5jyK8",
-            authDomain: "cloudzaiko.firebaseapp.com",
-            projectId: "cloudzaiko",
-            storageBucket: "cloudzaiko.firebasestorage.app",
-            messagingSenderId: "550736590103",
-            appId: "1:550736590103:web:a701131cd04c4143acb352"
-        };
-
+        let firebaseConfig = null;
         try {
             if (typeof __firebase_config !== 'undefined' && __firebase_config) {
-                firebaseConfig = typeof __firebase_config === 'string' 
-                    ? JSON.parse(__firebase_config) 
-                    : __firebase_config;
+                firebaseConfig = typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
             }
         } catch (e) {
-            console.warn("Failed to parse __firebase_config, using fallback config:", e);
+            console.warn("Failed to parse __firebase_config, falling back to default.", e);
         }
 
-        const app = initializeApp(firebaseConfig);
-        window.db = getFirestore(app);
-        window.auth = getAuth(app);
+        if (!firebaseConfig) {
+            firebaseConfig = {
+                apiKey: "AIzaSyAb3NPMFecrxDs3VwZjKzETsRlIuU5jyK8",
+                authDomain: "cloudzaiko.firebaseapp.com",
+                projectId: "cloudzaiko",
+                storageBucket: "cloudzaiko.firebasestorage.app",
+                messagingSenderId: "550736590103",
+                appId: "1:550736590103:web:a701131cd04c4143acb352"
+            };
+        }
+
+        try {
+            const app = initializeApp(firebaseConfig);
+            window.db = getFirestore(app);
+            window.auth = getAuth(app);
+        } catch (e) {
+            console.error("Firebase init failed:", e);
+        }
 
         // Path helpers following strict guidelines
         const getCollectionPath = () => collection(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_items');
         const getHistoryPath = () => collection(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_history');
 
+        function updateConnectionStatus(isSuccess, message) {
+            const pill = document.getElementById('connectionStatusPill');
+            if (!pill) return;
+            if (isSuccess) {
+                pill.className = "inline-flex items-center gap-1.5 font-bold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 rounded text-[11px]";
+                pill.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span><span>${message || 'Firestore クラウド同期中'}</span>`;
+            } else {
+                pill.className = "inline-flex items-center gap-1.5 font-bold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 px-2 py-0.5 rounded text-[11px]";
+                pill.innerHTML = `<span class="w-2 h-2 rounded-full bg-rose-500"></span><span>${message || '同期エラーが発生しました'}</span>`;
+            }
+        }
+
         async function initAuthAndData() {
+            if (!window.auth || !window.db) {
+                updateConnectionStatus(false, '同期エラーが発生しました');
+                showToast("Firebaseの初期化に失敗しました", "error");
+                return;
+            }
+
             try {
+                // Rule 3: Auth before Queries
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                     await signInWithCustomToken(window.auth, __initial_auth_token);
                 } else {
                     await signInAnonymously(window.auth);
                 }
 
-                const statusPill = document.getElementById('connectionStatusPill');
+                updateConnectionStatus(true, 'Firestore クラウド同期中');
 
                 // Setup realtime listener on inventory collection
                 onSnapshot(getCollectionPath(), (snapshot) => {
@@ -599,25 +623,12 @@
                     });
                     window.rawInventory = items;
                     updateDashboardAndTable();
+                    updateConnectionStatus(true, 'Firestore クラウド同期中');
                     document.getElementById('lastUpdatedDisplay').textContent = new Date().toLocaleTimeString('ja-JP');
-                    
-                    if (statusPill) {
-                        statusPill.className = "inline-flex items-center gap-1.5 font-bold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 rounded text-[11px]";
-                        statusPill.innerHTML = `
-                            <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                            <span>Firestore クラウド同期中</span>
-                        `;
-                    }
                 }, (err) => {
                     console.error("Firestore snapshot error:", err);
-                    showToast("同期エラーが発生しました: " + (err.message || ''), "error");
-                    if (statusPill) {
-                        statusPill.className = "inline-flex items-center gap-1.5 font-bold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 px-2 py-0.5 rounded text-[11px]";
-                        statusPill.innerHTML = `
-                            <span class="w-2 h-2 rounded-full bg-rose-500"></span>
-                            <span>同期エラーが発生しました</span>
-                        `;
-                    }
+                    updateConnectionStatus(false, '同期エラーが発生しました');
+                    showToast("同期エラーが発生しました。接続を確認してください。", "error");
                 });
 
                 // Setup history listener
@@ -627,12 +638,13 @@
                     logs.sort((a,b) => (b.timestamp || 0) - (a.timestamp || 0));
                     renderHistoryLogs(logs);
                 }, (err) => {
-                    console.error("History listener error:", err);
+                    console.error("Firestore history snapshot error:", err);
                 });
 
             } catch (error) {
                 console.error("Auth / Init error:", error);
-                showToast("Firebase認証・接続初期化に失敗しました", "error");
+                updateConnectionStatus(false, '同期エラーが発生しました');
+                showToast("Firebase認証/同期の初期化に失敗しました", "error");
             }
         }
 
@@ -828,17 +840,7 @@
             }).join('');
         };
 
-        // Dispatch (出庫) Operations
-        window.openDispatchModal = function(docId) {
-            const item = window.rawInventory.find(i => i.id === docId);
-            if (!item) return;
-            document.getElementById('dispatchDocId').value = docId;
-            document.getElementById('dispatchItemName').textContent = `[${item.maker}] ${item.model} (${item.productName || ''})`;
-            document.getElementById('dispatchCurrentQty').textContent = item.qty || 0;
-            document.getElementById('dispatchQtyInput').value = 1;
-            openModal('dispatchModal');
-        };
-
+        // Execute Dispatch
         window.executeDispatch = async function() {
             const docId = document.getElementById('dispatchDocId').value;
             const subQty = parseInt(document.getElementById('dispatchQtyInput').value) || 0;
@@ -854,41 +856,42 @@
                 return;
             }
 
-            try {
-                const newQty = current - subQty;
-                const itemRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_items', docId);
-                await updateDoc(itemRef, { qty: newQty });
+            const newQty = current - subQty;
 
-                // Log history
-                await addDoc(getHistoryPath(), {
-                    type: '出庫',
-                    model: item.model,
-                    maker: item.maker,
-                    qtyChange: -subQty,
-                    afterQty: newQty,
-                    worker: worker,
-                    timestamp: Date.now()
-                });
+            try {
+                if (window.db) {
+                    const itemRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_items', docId);
+                    await updateDoc(itemRef, { qty: newQty });
+
+                    // Log history
+                    await addDoc(getHistoryPath(), {
+                        type: '出庫',
+                        model: item.model,
+                        maker: item.maker,
+                        qtyChange: -subQty,
+                        afterQty: newQty,
+                        worker: worker,
+                        timestamp: Date.now()
+                    });
+                }
+                // Update local memory fallback
+                item.qty = newQty;
+                updateDashboardAndTable();
 
                 showToast(`${item.model} を ${subQty}点 出庫しました`);
                 closeModal('dispatchModal');
             } catch (err) {
                 console.error("Dispatch Error:", err);
-                showToast("出庫処理に失敗しました", "error");
+                // Fallback to local memory update
+                item.qty = newQty;
+                updateDashboardAndTable();
+                updateConnectionStatus(false, '同期エラーが発生しました');
+                showToast("出庫を実行しました（クラウド同期エラー）", "error");
+                closeModal('dispatchModal');
             }
         };
 
-        // Receive (入庫) Operations
-        window.openReceiveModal = function(docId) {
-            const item = window.rawInventory.find(i => i.id === docId);
-            if (!item) return;
-            document.getElementById('receiveDocId').value = docId;
-            document.getElementById('receiveItemName').textContent = `[${item.maker}] ${item.model} (${item.productName || ''})`;
-            document.getElementById('receiveCurrentQty').textContent = item.qty || 0;
-            document.getElementById('receiveQtyInput').value = 1;
-            openModal('receiveModal');
-        };
-
+        // Execute Receive
         window.executeReceive = async function() {
             const docId = document.getElementById('receiveDocId').value;
             const addQty = parseInt(document.getElementById('receiveQtyInput').value) || 0;
@@ -898,28 +901,37 @@
             const item = window.rawInventory.find(i => i.id === docId);
             if (!item) return;
 
-            try {
-                const current = parseInt(item.qty) || 0;
-                const newQty = current + addQty;
-                const itemRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_items', docId);
-                await updateDoc(itemRef, { qty: newQty });
+            const current = parseInt(item.qty) || 0;
+            const newQty = current + addQty;
 
-                // Log history
-                await addDoc(getHistoryPath(), {
-                    type: '入庫',
-                    model: item.model,
-                    maker: item.maker,
-                    qtyChange: addQty,
-                    afterQty: newQty,
-                    worker: worker,
-                    timestamp: Date.now()
-                });
+            try {
+                if (window.db) {
+                    const itemRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_items', docId);
+                    await updateDoc(itemRef, { qty: newQty });
+
+                    // Log history
+                    await addDoc(getHistoryPath(), {
+                        type: '入庫',
+                        model: item.model,
+                        maker: item.maker,
+                        qtyChange: addQty,
+                        afterQty: newQty,
+                        worker: worker,
+                        timestamp: Date.now()
+                    });
+                }
+                item.qty = newQty;
+                updateDashboardAndTable();
 
                 showToast(`${item.model} を ${addQty}点 入庫しました`);
                 closeModal('receiveModal');
             } catch (err) {
                 console.error("Receive Error:", err);
-                showToast("入庫処理に失敗しました", "error");
+                item.qty = newQty;
+                updateDashboardAndTable();
+                updateConnectionStatus(false, '同期エラーが発生しました');
+                showToast("入庫を実行しました（クラウド同期エラー）", "error");
+                closeModal('receiveModal');
             }
         };
 
@@ -970,13 +982,22 @@
             };
 
             try {
-                const itemRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_items', docId);
-                await updateDoc(itemRef, updatedData);
+                if (window.db) {
+                    const itemRef = doc(window.db, 'artifacts', window.appId, 'public', 'data', 'inventory_items', docId);
+                    await updateDoc(itemRef, updatedData);
+                }
+                const idx = window.rawInventory.findIndex(i => i.id === docId);
+                if (idx !== -1) {
+                    window.rawInventory[idx] = { ...window.rawInventory[idx], ...updatedData };
+                    updateDashboardAndTable();
+                }
                 showToast("全項目データを更新保存しました");
                 closeModal('detailModal');
             } catch (err) {
                 console.error("Save detail error:", err);
-                showToast("更新処理に失敗しました", "error");
+                updateConnectionStatus(false, '同期エラーが発生しました');
+                showToast("ローカル保存完了（クラウド同期エラー）", "error");
+                closeModal('detailModal');
             }
         };
 
