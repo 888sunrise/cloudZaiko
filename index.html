@@ -553,17 +553,25 @@
         window.auth = null;
         window.appId = typeof __app_id !== 'undefined' ? __app_id : 'zaiko-app-default';
 
-        // Firebase Configuration setup
-        const firebaseConfig = typeof __firebase_config !== 'undefined' 
-            ? JSON.parse(__firebase_config) 
-            : {
-                apiKey: "AIzaSyAb3NPMFecrxDs3VwZjKzETsRlIuU5jyK8",
-                authDomain: "cloudzaiko.firebaseapp.com",
-                projectId: "cloudzaiko",
-                storageBucket: "cloudzaiko.firebasestorage.app",
-                messagingSenderId: "550736590103",
-                appId: "1:550736590103:web:a701131cd04c4143acb352"
-            };
+        // Safe Firebase Configuration setup
+        let firebaseConfig = {
+            apiKey: "AIzaSyAb3NPMFecrxDs3VwZjKzETsRlIuU5jyK8",
+            authDomain: "cloudzaiko.firebaseapp.com",
+            projectId: "cloudzaiko",
+            storageBucket: "cloudzaiko.firebasestorage.app",
+            messagingSenderId: "550736590103",
+            appId: "1:550736590103:web:a701131cd04c4143acb352"
+        };
+
+        try {
+            if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                firebaseConfig = typeof __firebase_config === 'string' 
+                    ? JSON.parse(__firebase_config) 
+                    : __firebase_config;
+            }
+        } catch (e) {
+            console.warn("Failed to parse __firebase_config, using fallback config:", e);
+        }
 
         const app = initializeApp(firebaseConfig);
         window.db = getFirestore(app);
@@ -581,6 +589,8 @@
                     await signInAnonymously(window.auth);
                 }
 
+                const statusPill = document.getElementById('connectionStatusPill');
+
                 // Setup realtime listener on inventory collection
                 onSnapshot(getCollectionPath(), (snapshot) => {
                     const items = [];
@@ -590,9 +600,24 @@
                     window.rawInventory = items;
                     updateDashboardAndTable();
                     document.getElementById('lastUpdatedDisplay').textContent = new Date().toLocaleTimeString('ja-JP');
+                    
+                    if (statusPill) {
+                        statusPill.className = "inline-flex items-center gap-1.5 font-bold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 rounded text-[11px]";
+                        statusPill.innerHTML = `
+                            <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                            <span>Firestore クラウド同期中</span>
+                        `;
+                    }
                 }, (err) => {
                     console.error("Firestore snapshot error:", err);
-                    showToast("同期エラーが発生しました", "error");
+                    showToast("同期エラーが発生しました: " + (err.message || ''), "error");
+                    if (statusPill) {
+                        statusPill.className = "inline-flex items-center gap-1.5 font-bold text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 px-2 py-0.5 rounded text-[11px]";
+                        statusPill.innerHTML = `
+                            <span class="w-2 h-2 rounded-full bg-rose-500"></span>
+                            <span>同期エラーが発生しました</span>
+                        `;
+                    }
                 });
 
                 // Setup history listener
@@ -601,11 +626,13 @@
                     snapshot.forEach(docSnap => logs.push(docSnap.data()));
                     logs.sort((a,b) => (b.timestamp || 0) - (a.timestamp || 0));
                     renderHistoryLogs(logs);
+                }, (err) => {
+                    console.error("History listener error:", err);
                 });
 
             } catch (error) {
                 console.error("Auth / Init error:", error);
-                showToast("Firebase接続初期化に失敗しました", "error");
+                showToast("Firebase認証・接続初期化に失敗しました", "error");
             }
         }
 
@@ -1059,8 +1086,13 @@
             return rows;
         }
 
-        // Admin: CSV Bulk Import (A~N columns mapped: location, model, productName, qty, maker, category, sizeLen, sizeWid, dia, temp, color, flux, angle, notes)
+        // Admin: CSV Bulk Import (Batch optimized for stability)
         window.executeBulkImport = async function() {
+            if (!window.auth?.currentUser) {
+                showToast("クラウド認証が確立されていません。ページを再読み込みしてください。", "error");
+                return;
+            }
+
             const rawText = document.getElementById('importCsvArea').value.trim();
             if (!rawText) {
                 showToast("インポートするデータを選択するかテキストを入力してください", "error");
@@ -1071,10 +1103,14 @@
                 const parsedRows = parseCsvOrTsv(rawText);
                 let importedCount = 0;
 
+                const collectionRef = getCollectionPath();
+                let batch = writeBatch(window.db);
+                let batchOpCount = 0;
+
                 for (let cols of parsedRows) {
                     if (cols.length === 0) continue;
 
-                    // Header row skip check (e.g., "保管場所", "型番", "A", "B", etc.)
+                    // Header row skip check
                     const firstCol = cols[0] || '';
                     const secondCol = cols[1] || '';
                     if (firstCol.includes('保管場所') || firstCol.includes('型番') || secondCol.includes('型番') || firstCol === 'A') {
@@ -1100,9 +1136,22 @@
 
                     // Require at least model, productName or location
                     if (itemDoc.model || itemDoc.productName || itemDoc.location) {
-                        await addDoc(getCollectionPath(), itemDoc);
+                        const newDocRef = doc(collectionRef);
+                        batch.set(newDocRef, itemDoc);
                         importedCount++;
+                        batchOpCount++;
+
+                        // Commit every 400 items to fit Firestore limit
+                        if (batchOpCount >= 400) {
+                            await batch.commit();
+                            batch = writeBatch(window.db);
+                            batchOpCount = 0;
+                        }
                     }
+                }
+
+                if (batchOpCount > 0) {
+                    await batch.commit();
                 }
 
                 showToast(`${importedCount}件の在庫データを一括インポートしました`);
@@ -1111,7 +1160,7 @@
                 closeModal('adminModal');
             } catch (err) {
                 console.error("Bulk import error:", err);
-                showToast("インポート処理中にエラーが発生しました", "error");
+                showToast("インポート処理中にエラーが発生しました: " + (err.message || ''), "error");
             }
         };
 
